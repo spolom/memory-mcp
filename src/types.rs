@@ -60,6 +60,46 @@ pub fn validate_name(name: &str) -> Result<(), MemoryError> {
     Ok(())
 }
 
+/// Validate a git branch name to prevent ref injection.
+///
+/// Rejects names that are empty, contain `..`, start or end with `/` or `.`,
+/// contain consecutive slashes, or include characters that git disallows.
+pub fn validate_branch_name(branch: &str) -> Result<(), MemoryError> {
+    if branch.is_empty() {
+        return Err(MemoryError::InvalidInput {
+            reason: "branch name cannot be empty".into(),
+        });
+    }
+    if branch.contains("..") {
+        return Err(MemoryError::InvalidInput {
+            reason: "branch name cannot contain '..'".into(),
+        });
+    }
+    let invalid_chars = [' ', '~', '^', ':', '?', '*', '[', '\\'];
+    for c in branch.chars() {
+        if c.is_ascii_control() || invalid_chars.contains(&c) {
+            return Err(MemoryError::InvalidInput {
+                reason: format!("branch name contains invalid character '{}'", c),
+            });
+        }
+    }
+    if branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with('.')
+        || branch.starts_with('.')
+    {
+        return Err(MemoryError::InvalidInput {
+            reason: "branch name has invalid start/end character".into(),
+        });
+    }
+    if branch.contains("//") {
+        return Err(MemoryError::InvalidInput {
+            reason: "branch name contains consecutive slashes".into(),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Scope
 // ---------------------------------------------------------------------------
@@ -404,6 +444,23 @@ pub struct SyncArgs {
 }
 
 // ---------------------------------------------------------------------------
+// PullResult
+// ---------------------------------------------------------------------------
+
+/// The outcome of a `pull()` operation.
+#[derive(Debug)]
+pub enum PullResult {
+    /// No `origin` remote is configured — running in local-only mode.
+    NoRemote,
+    /// The local branch was already up to date with the remote.
+    UpToDate,
+    /// The remote was ahead and the branch was fast-forwarded.
+    FastForward,
+    /// A merge was performed; `conflicts_resolved` counts auto-resolved files.
+    Merged { conflicts_resolved: usize },
+}
+
+// ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
@@ -420,6 +477,8 @@ pub struct AppState {
     pub embedding: EmbeddingEngine,
     pub index: VectorIndex,
     pub auth: AuthProvider,
+    /// Branch name used for push/pull operations (default: "main").
+    pub branch: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -612,5 +671,50 @@ mod tests {
         let (scope, name) = parse_qualified_name("projects/my-project/nested/memory").unwrap();
         assert_eq!(scope, Scope::Project("my-project".to_string()));
         assert_eq!(name, "nested/memory");
+    }
+
+    // validate_branch_name tests
+
+    #[test]
+    fn validate_branch_name_accepts_valid() {
+        assert!(validate_branch_name("main").is_ok());
+        assert!(validate_branch_name("feature/foo").is_ok());
+        assert!(validate_branch_name("release-1.0").is_ok());
+        assert!(validate_branch_name("a/b/c").is_ok());
+        assert!(validate_branch_name("my-branch_v2").is_ok());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_empty() {
+        assert!(validate_branch_name("").is_err());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_dot_dot() {
+        assert!(validate_branch_name("foo..bar").is_err());
+        assert!(validate_branch_name("..").is_err());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_invalid_chars() {
+        for name in &[
+            "foo bar", "foo~bar", "foo^bar", "foo:bar", "foo?bar", "foo*bar", "foo[bar",
+            "foo\\bar",
+        ] {
+            assert!(validate_branch_name(name).is_err(), "should reject: {}", name);
+        }
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_invalid_start_end() {
+        assert!(validate_branch_name("/foo").is_err());
+        assert!(validate_branch_name("foo/").is_err());
+        assert!(validate_branch_name(".foo").is_err());
+        assert!(validate_branch_name("foo.").is_err());
+    }
+
+    #[test]
+    fn validate_branch_name_rejects_consecutive_slashes() {
+        assert!(validate_branch_name("foo//bar").is_err());
     }
 }
