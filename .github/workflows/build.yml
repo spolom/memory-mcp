@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: {}
 
@@ -30,10 +30,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: taiki-e/install-action@94a7388bec5d4c8dd93e3ebf09e0ff448f3f6f4d # v2.68.35
-        with:
-          tool: cargo-binstall@1.17.7
-      - run: cargo binstall -y --no-symlinks cargo-nextest@=0.9.131
+      - name: Install cargo-nextest
+        run: |
+          curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.131/cargo-nextest-0.9.131-x86_64-unknown-linux-gnu.tar.gz" \
+            -o /tmp/cargo-nextest.tar.gz
+          echo "8e38b16299864c9f597c9a1e2caf25b7e8b598ffc659ec014c2c735a9befd8fa  /tmp/cargo-nextest.tar.gz" | sha256sum -c -
+          tar xzf /tmp/cargo-nextest.tar.gz -C /usr/local/bin
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo clippy --workspace --features k8s -- -D warnings
@@ -46,10 +48,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: taiki-e/install-action@94a7388bec5d4c8dd93e3ebf09e0ff448f3f6f4d # v2.68.35
-        with:
-          tool: cargo-binstall@1.17.7
-      - run: cargo binstall -y --no-symlinks cargo-audit@=0.22.1
+      - name: Install cargo-audit
+        run: |
+          curl -fsSL "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.1/cargo-audit-x86_64-unknown-linux-musl-v0.22.1.tgz" \
+            -o /tmp/cargo-audit.tar.gz
+          echo "c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab  /tmp/cargo-audit.tar.gz" | sha256sum -c -
+          tar xzf /tmp/cargo-audit.tar.gz -C /usr/local/bin --strip-components=1
       - run: cargo audit
 
   build:
