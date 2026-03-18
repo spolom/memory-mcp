@@ -1,0 +1,49 @@
+# Stage 1: Build
+# Trixie (not Bookworm) required: ort_sys ships pre-built ONNX Runtime binaries
+# linked against glibc ≥2.38 (__isoc23_strtoll etc.). Bookworm has glibc 2.36.
+FROM rust:trixie AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY . .
+# BuildKit cache mounts keep the cargo registry and compiled dependencies
+# across builds, so only changed crates are recompiled. The caches are not
+# part of the image — they persist on the builder between runs.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --features k8s && \
+    cp target/release/memory-mcp /usr/local/bin/memory-mcp
+
+# Stage 2: Model download
+# fastembed downloads models from HuggingFace into its cache directory on first
+# use. We pre-download by running "warmup" in this stage so the runtime image
+# ships with the model already on disk — no internet access required at pod
+# startup, and cold-start latency is eliminated.
+#
+# FASTEMBED_CACHE_DIR must be set to an absolute path — fastembed defaults to
+# `.fastembed_cache` relative to CWD, which fails when CWD is not writable.
+FROM debian:trixie-slim AS model
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libdbus-1-3 && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 app
+COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
+USER app
+ENV FASTEMBED_CACHE_DIR=/home/app/.cache/fastembed
+RUN /usr/local/bin/memory-mcp warmup
+
+# Stage 3: Runtime
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git libdbus-1-3 && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 memory-mcp
+COPY --from=builder /usr/local/bin/memory-mcp /usr/local/bin/memory-mcp
+# Copy the pre-warmed model cache from the model stage.
+COPY --from=model /home/app/.cache/fastembed /home/memory-mcp/.cache/fastembed
+RUN chown -R memory-mcp:memory-mcp /home/memory-mcp/.cache
+USER memory-mcp
+WORKDIR /home/memory-mcp
+ENV MEMORY_MCP_BIND=0.0.0.0:8080
+ENV MEMORY_MCP_REPO_PATH=/data/repo
+# Pin FASTEMBED_CACHE_DIR to the same absolute path used in the model stage,
+# so fastembed finds the pre-warmed model files regardless of CWD.
+ENV FASTEMBED_CACHE_DIR=/home/memory-mcp/.cache/fastembed
+EXPOSE 8080
+ENTRYPOINT ["memory-mcp"]
+CMD ["serve"]
