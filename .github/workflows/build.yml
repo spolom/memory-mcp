@@ -69,22 +69,35 @@ jobs:
           key: ${{ matrix.target }}
       - run: cargo build --features k8s
 
+  # Verify the declared MSRV (Cargo.toml rust-version) still compiles.
+  msrv:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: msrv
+      - run: cargo check --workspace --all-features
+
   audit:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Install cargo-audit
-        run: |
-          curl -fsSL "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.1/cargo-audit-x86_64-unknown-linux-musl-v0.22.1.tgz" \
-            -o /tmp/cargo-audit.tar.gz
-          echo "c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab  /tmp/cargo-audit.tar.gz" | sha256sum -c -
-          tar xzf /tmp/cargo-audit.tar.gz -C /usr/local/bin --strip-components=1
-      - run: cargo audit
+      - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2.0.15
+        with:
+          command: check
 
   build:
-    needs: [test, audit, cross-compile]
+    needs: [test, audit, cross-compile, msrv]
     runs-on: ubuntu-latest
     permissions:
       contents: read
