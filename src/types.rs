@@ -108,7 +108,7 @@ pub fn validate_branch_name(branch: &str) -> Result<(), MemoryError> {
 ///
 /// - `Global`           → `global/`
 /// - `Project(name)`    → `projects/{name}/`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "name")]
 #[non_exhaustive]
 pub enum Scope {
@@ -317,6 +317,48 @@ impl Memory {
 }
 
 // ---------------------------------------------------------------------------
+// ScopeFilter — for read-only queries (recall, list)
+// ---------------------------------------------------------------------------
+
+/// Controls which scopes are searched during read-only operations.
+///
+/// This is distinct from [`Scope`], which is a storage target for write
+/// operations. `ScopeFilter` describes which memories are *returned*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeFilter {
+    /// Search only global memories.
+    GlobalOnly,
+    /// Search a specific project's memories **and** global memories.
+    ProjectAndGlobal(String),
+    /// Search all scopes.
+    All,
+}
+
+/// Parse a scope string into a [`ScopeFilter`] for use in `recall` and `list`.
+///
+/// | Input | Result |
+/// |---|---|
+/// | `None` | `GlobalOnly` |
+/// | `"global"` | `GlobalOnly` |
+/// | `"project:{name}"` | `ProjectAndGlobal(<name>)` |
+/// | `"all"` | `All` |
+pub fn parse_scope_filter(scope: Option<&str>) -> Result<ScopeFilter, MemoryError> {
+    match scope {
+        None | Some("global") => Ok(ScopeFilter::GlobalOnly),
+        Some("all") => Ok(ScopeFilter::All),
+        Some(s) => {
+            let parsed = s.parse::<Scope>()?;
+            match parsed {
+                Scope::Project(name) => Ok(ScopeFilter::ProjectAndGlobal(name)),
+                // "global" is already handled above; exhaustive match ensures
+                // a compile error if new Scope variants are added.
+                Scope::Global => Ok(ScopeFilter::GlobalOnly),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
@@ -381,7 +423,7 @@ pub struct RememberArgs {
     /// Optional list of tags for categorisation.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Scope: `"global"` or `"project:{name}"`. Defaults to `"global"`.
+    /// Scope: 'global' or 'project:{name}'. Defaults to 'global'. Use 'project:{basename-of-your-cwd}' for project-scoped storage.
     #[serde(default)]
     pub scope: Option<String>,
     /// Optional hint about the source of this memory.
@@ -394,7 +436,7 @@ pub struct RememberArgs {
 pub struct RecallArgs {
     /// Natural-language query to search for.
     pub query: String,
-    /// Scope filter: `"global"`, `"project:{name}"`, or omit for all.
+    /// Scope: 'global', 'project:{name}', 'all', or omit for global-only. Use 'project:{basename-of-your-cwd}' to search your current project + global memories. Use 'all' to search across every scope.
     #[serde(default)]
     pub scope: Option<String>,
     /// Maximum number of results to return. Defaults to 5.
@@ -407,7 +449,7 @@ pub struct RecallArgs {
 pub struct ForgetArgs {
     /// Exact name of the memory to delete.
     pub name: String,
-    /// Scope of the memory. Defaults to "global".
+    /// Scope of the memory. Defaults to 'global'. Use 'project:{basename-of-your-cwd}' for project-scoped memories.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -423,7 +465,7 @@ pub struct EditArgs {
     /// New tag list (replaces existing). Omit to keep current tags.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
-    /// Scope of the memory. Defaults to "global".
+    /// Scope of the memory. Defaults to 'global'. Use 'project:{basename-of-your-cwd}' for project-scoped memories.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -431,7 +473,7 @@ pub struct EditArgs {
 /// Arguments for the `list` tool — browse stored memories.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListArgs {
-    /// Scope filter: `"global"`, `"project:{name}"`, or omit for all.
+    /// Scope: 'global', 'project:{name}', 'all', or omit for global-only. Use 'project:{basename-of-your-cwd}' to list project + global memories. Use 'all' to list everything.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -441,7 +483,7 @@ pub struct ListArgs {
 pub struct ReadArgs {
     /// Exact name of the memory to read.
     pub name: String,
-    /// Scope of the memory. Defaults to "global".
+    /// Scope of the memory. Defaults to 'global'. Use 'project:{basename-of-your-cwd}' for project-scoped memories.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -528,7 +570,7 @@ pub struct ReindexStats {
 use std::sync::Arc;
 
 use crate::{
-    auth::AuthProvider, embedding::EmbeddingBackend, index::VectorIndex, repo::MemoryRepo,
+    auth::AuthProvider, embedding::EmbeddingBackend, index::ScopedIndex, repo::MemoryRepo,
 };
 
 /// Shared application state threaded through the Axum server.
@@ -541,8 +583,8 @@ pub struct AppState {
     pub repo: Arc<MemoryRepo>,
     /// Backend used to compute text embeddings.
     pub embedding: Box<dyn EmbeddingBackend>,
-    /// In-memory vector index for semantic search.
-    pub index: VectorIndex,
+    /// In-memory vector index for semantic search (scope-partitioned).
+    pub index: ScopedIndex,
     /// Authentication provider for API access control.
     pub auth: AuthProvider,
     /// Branch name used for push/pull operations (default: "main").
@@ -555,7 +597,7 @@ impl AppState {
         repo: Arc<MemoryRepo>,
         branch: String,
         embedding: Box<dyn EmbeddingBackend>,
-        index: VectorIndex,
+        index: ScopedIndex,
         auth: AuthProvider,
     ) -> Self {
         Self {
@@ -806,5 +848,38 @@ mod tests {
     #[test]
     fn validate_branch_name_rejects_consecutive_slashes() {
         assert!(validate_branch_name("foo//bar").is_err());
+    }
+
+    // parse_scope_filter tests
+
+    #[test]
+    fn scope_filter_none_defaults_to_global_only() {
+        assert_eq!(parse_scope_filter(None).unwrap(), ScopeFilter::GlobalOnly);
+    }
+
+    #[test]
+    fn scope_filter_global_returns_global_only() {
+        assert_eq!(
+            parse_scope_filter(Some("global")).unwrap(),
+            ScopeFilter::GlobalOnly
+        );
+    }
+
+    #[test]
+    fn scope_filter_project_returns_project_and_global() {
+        assert_eq!(
+            parse_scope_filter(Some("project:my-proj")).unwrap(),
+            ScopeFilter::ProjectAndGlobal("my-proj".to_string()),
+        );
+    }
+
+    #[test]
+    fn scope_filter_all_returns_all() {
+        assert_eq!(parse_scope_filter(Some("all")).unwrap(), ScopeFilter::All);
+    }
+
+    #[test]
+    fn scope_filter_invalid_returns_error() {
+        assert!(parse_scope_filter(Some("bogus")).is_err());
     }
 }

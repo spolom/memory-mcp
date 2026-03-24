@@ -11,12 +11,12 @@ use tracing::{info, warn, Instrument};
 use crate::{
     embedding::EmbeddingBackend,
     error::MemoryError,
-    index::VectorIndex,
+    index::ScopedIndex,
     repo::MemoryRepo,
     types::{
-        parse_qualified_name, parse_scope, validate_name, AppState, ChangedMemories, EditArgs,
-        ForgetArgs, ListArgs, Memory, MemoryMetadata, PullResult, ReadArgs, RecallArgs,
-        ReindexStats, RememberArgs, Scope, SyncArgs,
+        parse_qualified_name, parse_scope, parse_scope_filter, validate_name, AppState,
+        ChangedMemories, EditArgs, ForgetArgs, ListArgs, Memory, MemoryMetadata, PullResult,
+        ReadArgs, RecallArgs, ReindexStats, RememberArgs, Scope, ScopeFilter, SyncArgs,
     },
 };
 
@@ -44,26 +44,36 @@ const MAX_CONTENT_SIZE: usize = 1_048_576;
 async fn incremental_reindex(
     repo: &Arc<MemoryRepo>,
     embedding: &dyn EmbeddingBackend,
-    index: &VectorIndex,
+    index: &ScopedIndex,
     changes: &ChangedMemories,
 ) -> ReindexStats {
     let mut stats = ReindexStats::default();
 
     // ---- 1. Removals --------------------------------------------------------
     for name in &changes.removed {
-        if let Some(key) = index.find_key_by_name(name) {
-            if let Err(e) = index.remove(key) {
+        match parse_qualified_name(name) {
+            Ok((scope, _)) => {
+                if let Err(e) = index.remove(&scope, name) {
+                    warn!(
+                        qualified_name = %name,
+                        error = %e,
+                        "incremental_reindex: failed to remove vector; skipping"
+                    );
+                    stats.errors += 1;
+                } else {
+                    stats.removed += 1;
+                }
+            }
+            Err(e) => {
                 warn!(
                     qualified_name = %name,
                     error = %e,
-                    "incremental_reindex: failed to remove vector; skipping"
+                    "incremental_reindex: cannot parse qualified name for removal; skipping"
                 );
-                stats.errors += 1;
-            } else {
-                stats.removed += 1;
+                // If we can't parse the name, we can't look it up — not an indexing error.
             }
         }
-        // If not in index, nothing to do — not an error.
+        // If not in index, remove is a no-op — not an error.
     }
 
     // ---- 2. Resolve (scope, name) pairs for upserts -------------------------
@@ -85,10 +95,9 @@ async fn incremental_reindex(
     }
 
     // ---- 3. Read memories from disk -----------------------------------------
-    // (qualified_name, content, old_key_if_exists)
-    let mut to_embed: Vec<(String, String, Option<u64>)> = Vec::new();
+    // (scope, qualified_name, content)
+    let mut to_embed: Vec<(Scope, String, String)> = Vec::new();
     for (scope, name, qualified) in &pairs {
-        let old_key = index.find_key_by_name(qualified);
         let memory = match repo.read_memory(name, scope).await {
             Ok(m) => m,
             Err(e) => {
@@ -101,7 +110,7 @@ async fn incremental_reindex(
                 continue;
             }
         };
-        to_embed.push((qualified.clone(), memory.content, old_key));
+        to_embed.push((scope.clone(), qualified.clone(), memory.content));
     }
 
     if to_embed.is_empty() {
@@ -109,7 +118,7 @@ async fn incremental_reindex(
     }
 
     // ---- 4. Batch embed all content -----------------------------------------
-    let contents: Vec<String> = to_embed.iter().map(|(_, c, _)| c.clone()).collect();
+    let contents: Vec<String> = to_embed.iter().map(|(_, _, c)| c.clone()).collect();
     let vectors = match embedding.embed(&contents).await {
         Ok(v) => v,
         Err(batch_err) => {
@@ -122,7 +131,7 @@ async fn incremental_reindex(
                     Err(e) => {
                         warn!(
                             error = %e,
-                            qualified_name = %to_embed[i].0,
+                            qualified_name = %to_embed[i].1,
                             "incremental_reindex: per-item embed failed; skipping"
                         );
                         failed.push(i);
@@ -139,31 +148,19 @@ async fn incremental_reindex(
     };
 
     // ---- 5. Update index entries --------------------------------------------
-    for ((qualified_name, _, old_key), vector) in to_embed.iter().zip(vectors.iter()) {
-        let is_update = old_key.is_some();
+    for ((scope, qualified_name, _), vector) in to_embed.iter().zip(vectors.iter()) {
+        let is_update = index.find_key_by_name(qualified_name).is_some();
 
-        // Add new entry first — if this fails, leave the old entry intact.
-        match index.add_with_next_key(vector, qualified_name.clone()) {
+        match index.add(scope, vector, qualified_name.clone()) {
             Ok(_) => {}
             Err(e) => {
                 warn!(
                     qualified_name = %qualified_name,
                     error = %e,
-                    "incremental_reindex: add_with_next_key failed; skipping"
+                    "incremental_reindex: add failed; skipping"
                 );
                 stats.errors += 1;
                 continue;
-            }
-        }
-
-        // Now remove the old entry (new one already in the index).
-        if let Some(key) = old_key {
-            if let Err(e) = index.remove(*key) {
-                warn!(
-                    qualified_name = %qualified_name,
-                    error = %e,
-                    "incremental_reindex: old vector removal failed; continuing"
-                );
             }
         }
 
@@ -195,8 +192,9 @@ impl MemoryServer {
     /// Returns the assigned memory ID on success.
     #[tool(
         name = "remember",
-        description = "Store a new memory. Saves the content to the git-backed repository \
-        and indexes it for semantic search. Returns the assigned memory ID."
+        description = "Store a new memory. Saves the content to the git-backed repository and \
+        indexes it for semantic search. Use scope 'project:<basename-of-your-cwd>' for \
+        project-specific memories or omit for global. Returns the assigned memory ID."
     )]
     async fn remember(
         &self,
@@ -220,7 +218,7 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             let scope = parse_scope(args.scope.as_deref()).map_err(ErrorData::from)?;
-            let metadata = MemoryMetadata::new(scope, args.tags, args.source);
+            let metadata = MemoryMetadata::new(scope.clone(), args.tags, args.source);
             let memory = Memory::new(args.name, args.content, metadata);
 
             // Order: (1) embed, (2) add to index, (3) save to repo.
@@ -236,26 +234,10 @@ impl MemoryServer {
 
             let qualified_name = format!("{}/{}", memory.metadata.scope.dir_prefix(), memory.name);
 
-            // Look up any existing key BEFORE adding — we remove it only after
-            // the new entry is successfully inserted, so a failure in
-            // add_with_next_key never leaves the memory orphaned.
-            let old_key = state.index.find_key_by_name(&qualified_name);
-
             state
                 .index
-                .add_with_next_key(&vector, qualified_name)
+                .add(&scope, &vector, qualified_name)
                 .map_err(ErrorData::from)?;
-
-            // Now safe to remove the old entry (new one is already in the index).
-            if let Some(old_key) = old_key {
-                if let Err(e) = state.index.remove(old_key) {
-                    warn!(
-                        name = %memory.name,
-                        error = %e,
-                        "old vector removal failed during remember; continuing"
-                    );
-                }
-            }
 
             let start = Instant::now();
             state
@@ -284,8 +266,10 @@ impl MemoryServer {
     /// Returns a JSON array of matching memories sorted by relevance.
     #[tool(
         name = "recall",
-        description = "Search memories by semantic similarity. Embeds the query and returns \
-        the top matching memories as a JSON array with name, scope, tags, and content snippet."
+        description = "Search memories by semantic similarity. Returns the top matching memories as a JSON array \
+        with name, scope, tags, and content snippet.\n\n\
+        Scope: pass 'project:<basename-of-your-cwd>' to search your current project + global memories, \
+        'global' for global-only, or 'all' to search everything. Omitting scope defaults to global-only."
     )]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> Result<String, ErrorData> {
         let span = tracing::info_span!(
@@ -297,16 +281,10 @@ impl MemoryServer {
         let state = Arc::clone(&self.state);
         async move {
             // Parse optional scope filter.
-            let scope_filter: Option<Scope> = args
-                .scope
-                .as_deref()
-                .map(|s| s.parse::<Scope>())
-                .transpose()
-                .map_err(ErrorData::from)?;
+            let scope_filter =
+                parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let limit = args.limit.unwrap_or(5).min(100);
-            // Over-fetch to compensate for scope filtering.
-            let fetch_limit = limit.saturating_mul(3);
 
             let start = Instant::now();
             let query_vector = state
@@ -319,7 +297,7 @@ impl MemoryServer {
             let start = Instant::now();
             let results = state
                 .index
-                .search(&query_vector, fetch_limit)
+                .search(&scope_filter, &query_vector, limit)
                 .map_err(ErrorData::from)?;
             info!(
                 search_ms = start.elapsed().as_millis(),
@@ -329,10 +307,11 @@ impl MemoryServer {
 
             let pre_filter_count = results.len();
             let mut results_vec = Vec::new();
-            let mut scope_filtered: usize = 0;
             let mut skipped_errors: usize = 0;
 
             for (_key, qualified_name, distance) in results {
+                // The index returns at most `limit` candidates; this guard is a safety
+                // net that only activates if more candidates arrive than expected.
                 if results_vec.len() >= limit {
                     break;
                 }
@@ -348,14 +327,6 @@ impl MemoryServer {
                         continue;
                     }
                 };
-
-                // Apply scope filter if present.
-                if let Some(ref filter) = scope_filter {
-                    if &scope != filter {
-                        scope_filtered += 1;
-                        continue;
-                    }
-                }
 
                 // Read the memory; if it was deleted but still in the index, skip it.
                 let memory = match state.repo.read_memory(&name, &scope).await {
@@ -386,7 +357,7 @@ impl MemoryServer {
 
             info!(
                 returned = results_vec.len(),
-                scope_filtered, skipped_errors, "recall complete"
+                skipped_errors, "recall complete"
             );
 
             Ok(serde_json::json!({
@@ -394,7 +365,6 @@ impl MemoryServer {
                 "count": results_vec.len(),
                 "limit": limit,
                 "pre_filter_count": pre_filter_count,
-                "scope_filtered": scope_filtered,
                 "skipped_errors": skipped_errors,
             })
             .to_string())
@@ -411,8 +381,9 @@ impl MemoryServer {
     /// Returns `"ok"` on success.
     #[tool(
         name = "forget",
-        description = "Delete a memory by name. Removes the file from git and the vector from \
-        the search index. Returns 'ok' on success."
+        description = "Delete a memory by name. Use scope 'project:<basename-of-your-cwd>' for project-scoped \
+        memories or omit for global. Removes the file from git and the vector from the search index. \
+        Returns 'ok' on success."
     )]
     async fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
@@ -427,32 +398,18 @@ impl MemoryServer {
 
             let start = Instant::now();
 
-            let qualified_name = format!("{}/{}", scope.dir_prefix(), args.name);
-
-            // Look up the vector key by name instead of deriving it from UUID.
-            match state.index.find_key_by_name(&qualified_name) {
-                Some(key) => {
-                    if let Err(e) = state.index.remove(key) {
-                        warn!(
-                            name = %args.name,
-                            error = %e,
-                            "vector removal failed during forget; continuing"
-                        );
-                    }
-                }
-                None => {
-                    warn!(
-                        name = %args.name,
-                        "vector key not found in index during forget; continuing"
-                    );
-                }
-            }
-
+            // Delete from repo first — if this fails, index is untouched, memory stays functional.
             state
                 .repo
                 .delete_memory(&args.name, &scope)
                 .await
                 .map_err(ErrorData::from)?;
+
+            // Remove from index (best-effort — stale entries are skipped at recall time).
+            let qualified_name = format!("{}/{}", scope.dir_prefix(), args.name);
+            if let Err(e) = state.index.remove(&scope, &qualified_name) {
+                warn!(name = %args.name, error = %e, "vector removal failed during forget; stale entry will be skipped at recall");
+            }
 
             info!(
                 ms = start.elapsed().as_millis(),
@@ -477,7 +434,8 @@ impl MemoryServer {
     #[tool(
         name = "edit",
         description = "Edit an existing memory. Supports partial updates — omit content or \
-        tags to preserve existing values. Re-embeds and re-indexes the memory. Returns the memory ID."
+        tags to preserve existing values. Re-embeds and re-indexes the memory. Use scope \
+        'project:<basename-of-your-cwd>' for project-scoped memories. Returns the memory ID."
     )]
     async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
@@ -523,7 +481,7 @@ impl MemoryServer {
             memory.metadata.updated_at = Utc::now();
 
             // Only re-embed and re-index when content changed.
-            // Order: (1) embed, (2) remove old + add new index entry, (3) save to repo.
+            // Order: (1) embed, (2) upsert index entry, (3) save to repo.
             if content_changed {
                 let qualified_name =
                     format!("{}/{}", memory.metadata.scope.dir_prefix(), memory.name);
@@ -535,24 +493,10 @@ impl MemoryServer {
                     .await
                     .map_err(ErrorData::from)?;
 
-                // Add new entry first, then remove old — so a failure in
-                // add_with_next_key never leaves the memory orphaned.
-                let old_key = state.index.find_key_by_name(&qualified_name);
-
                 state
                     .index
-                    .add_with_next_key(&vector, qualified_name)
+                    .add(&scope, &vector, qualified_name)
                     .map_err(ErrorData::from)?;
-
-                if let Some(old_key) = old_key {
-                    if let Err(e) = state.index.remove(old_key) {
-                        warn!(
-                            name = %args.name,
-                            error = %e,
-                            "old vector key removal failed during edit; continuing"
-                        );
-                    }
-                }
             }
 
             // Persist to repo (last, so partial failures leave recoverable state).
@@ -586,27 +530,45 @@ impl MemoryServer {
     /// created_at, updated_at). Full content bodies are omitted for brevity.
     #[tool(
         name = "list",
-        description = "List stored memories. Optionally filter by scope ('global' or \
-        'project:<name>'). Returns a JSON array of memory summaries without full content."
+        description = "List stored memories. Pass 'project:<basename-of-your-cwd>' for project + global memories, \
+        'global' for global-only, or 'all' for everything. Omitting scope defaults to global-only. \
+        Returns a JSON array of memory summaries without full content."
     )]
     async fn list(&self, Parameters(args): Parameters<ListArgs>) -> Result<String, ErrorData> {
         let span = tracing::info_span!("list", scope = ?args.scope);
         let state = Arc::clone(&self.state);
         async move {
-            // None means all scopes.
-            let scope_filter: Option<Scope> = args
-                .scope
-                .as_deref()
-                .map(|s| s.parse::<Scope>())
-                .transpose()
-                .map_err(ErrorData::from)?;
+            let scope_filter =
+                parse_scope_filter(args.scope.as_deref()).map_err(ErrorData::from)?;
 
             let start = Instant::now();
-            let memories = state
-                .repo
-                .list_memories(scope_filter.as_ref())
-                .await
-                .map_err(ErrorData::from)?;
+            let memories = match &scope_filter {
+                ScopeFilter::GlobalOnly => state
+                    .repo
+                    .list_memories(Some(&Scope::Global))
+                    .await
+                    .map_err(ErrorData::from)?,
+                ScopeFilter::All => state
+                    .repo
+                    .list_memories(None)
+                    .await
+                    .map_err(ErrorData::from)?,
+                ScopeFilter::ProjectAndGlobal(project_name) => {
+                    let project_scope = Scope::Project(project_name.clone());
+                    let mut global = state
+                        .repo
+                        .list_memories(Some(&Scope::Global))
+                        .await
+                        .map_err(ErrorData::from)?;
+                    let project = state
+                        .repo
+                        .list_memories(Some(&project_scope))
+                        .await
+                        .map_err(ErrorData::from)?;
+                    global.extend(project);
+                    global
+                }
+            };
             info!(
                 ms = start.elapsed().as_millis(),
                 count = memories.len(),
@@ -643,8 +605,9 @@ impl MemoryServer {
     /// metadata (id, scope, tags, timestamps) as a JSON object.
     #[tool(
         name = "read",
-        description = "Read a specific memory by name. Returns the full markdown content and \
-        metadata (id, scope, tags, timestamps) as a JSON object."
+        description = "Read a specific memory by name. Use scope 'project:<basename-of-your-cwd>' for \
+        project-scoped memories or omit for global. Returns the full markdown content and metadata \
+        (id, scope, tags, timestamps) as a JSON object."
     )]
     async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> Result<String, ErrorData> {
         validate_name(&args.name).map_err(ErrorData::from)?;
@@ -810,11 +773,14 @@ impl MemoryServer {
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "A semantic memory system for AI coding agents. Memories are stored as \
-                 markdown files in a git repository and indexed for semantic retrieval. \
-                 Use `remember` to store, `recall` to search, `read` to fetch a specific \
-                 memory, `edit` to update, `forget` to delete, `list` to browse, and \
-                 `sync` to push/pull the remote."
+            "A semantic memory system for AI coding agents. Memories are stored as markdown files \
+            in a git repository and indexed for semantic retrieval. Use `remember` to store, `recall` \
+            to search, `read` to fetch a specific memory, `edit` to update, `forget` to delete, \
+            `list` to browse, and `sync` to push/pull the remote.\n\n\
+            Scope convention: always pass scope='project:<basename-of-your-cwd>' when working within \
+            a project. This returns project memories alongside global ones. Omitting scope defaults to \
+            global-only for queries (recall, list) and targets a single memory for point operations \
+            (remember, edit, read, forget). Use scope='all' to search across all projects."
                 .to_string(),
         )
     }
